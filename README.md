@@ -77,4 +77,4 @@ MacMote speaks the same protocol as the official Google TV phone app (**Android 
 
 ## Resetting the pairing
 
-Right-click the icon → **Сполучити з TV заново** (Pair with TV again).
+Right-click the icon → **Pair with TV again**.
