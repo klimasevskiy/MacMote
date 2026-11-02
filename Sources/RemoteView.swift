@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 /// Remote body metrics. Corner radii are concentric with the controls in each corner:
-/// power key (r 20) at the top, the large keys (r 40) at the bottom, both inset by `inset`.
+/// home and power keys (r 20) at the top, the large keys (r 40) at the bottom, both inset by `inset`.
 private enum M {
     static let width: CGFloat = 215
     static let inset: CGFloat = 10
@@ -24,6 +24,8 @@ struct RemoteView: View {
 
     var body: some View {
         VStack(spacing: 8) {
+            if tv.state == .choosing { chooserCard }
+            if tv.state == .confirmOnTV { confirmCard }
             if tv.state == .enterCode || tv.state == .pairing { pairingCard }
             if ui.keyboardOpen && tv.state == .connected { keyboardCard }
             remote
@@ -42,9 +44,13 @@ struct RemoteView: View {
 
     private var remote: some View {
         VStack(spacing: 14) {
-            HStack(alignment: .top) {
-                status
-                Spacer(minLength: 6)
+            // Home and power mirror each other in the top corners; status sits between them.
+            HStack(spacing: 6) {
+                RoundKey(size: M.power, label: "Головний екран", hint: "Головний екран (H)",
+                         action: { tv.send(.home) }) {
+                    Image(systemName: "house.fill").font(.system(size: 15))
+                }
+                status.frame(maxWidth: .infinity)
                 RoundKey(size: M.power, label: "Живлення", hint: "Увімкнути або вимкнути TV",
                          action: { tv.send(.power) }) {
                     Image(systemName: "power").font(.system(size: 17))
@@ -105,20 +111,21 @@ struct RemoteView: View {
             case .connected: return (.green, tv.tvName)
             case .connecting: return (.orange, "Підключення…")
             case .searching: return (.orange, "Пошук TV…")
-            case .pairing, .enterCode: return (.blue, "Сполучення")
+            case .pairing, .enterCode, .confirmOnTV: return (.blue, "Сполучення")
+            case .choosing: return (.blue, "Оберіть телевізор")
             case .idle: return (.gray, tv.tvName)
             case .offline(let msg): return (.red, msg)
             }
         }()
-        return HStack(alignment: .firstTextBaseline, spacing: 5) {
-            Circle().fill(color).frame(width: 7, height: 7)
+        return VStack(spacing: 3) {
+            Circle().fill(color).frame(width: 6, height: 6)
             Text(label)
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(scheme == .dark ? Color(white: 0.85) : Color(white: 0.25))
+                .multilineTextAlignment(.center)
                 .lineLimit(2)
+                .minimumScaleFactor(0.85)
         }
-        .padding(.leading, 8)
-        .padding(.top, 4)
         .contentShape(Rectangle())
         .onTapGesture { if case .offline = tv.state { tv.connect() } }
         .help(label)
@@ -137,7 +144,7 @@ struct RemoteView: View {
                 .onChange(of: text) { old, t in
                     if prefilling { prefilling = false } else { tv.editText(from: old, to: t) }
                 }
-                .onSubmit { tv.send(.enter) }
+                .onSubmit { tv.submitText() }
                 .onExitCommand { ui.keyboardOpen = false }
             if !text.isEmpty {
                 Button { text = "" } label: { Image(systemName: "xmark.circle.fill") }
@@ -148,6 +155,43 @@ struct RemoteView: View {
         }
         .padding(.horizontal, 12)
         .frame(height: 36)
+        .card()
+    }
+
+    private var chooserCard: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Телевізори в мережі")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.bottom, 2)
+            ForEach(tv.devices, id: \.self) { d in
+                DeviceRow(device: d, current: d.id == tv.device?.id) { tv.select(d) }
+            }
+            Divider().padding(.vertical, 4)
+            Button { tv.scan(choose: true) } label: {
+                Label("Шукати знову", systemImage: "arrow.clockwise")
+                    .font(.system(size: 12))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        }
+        .padding(8)
+        .card()
+    }
+
+    private var confirmCard: some View {
+        Label {
+            Text("Натисніть «Дозволити» на телевізорі")
+                .font(.system(size: 12, weight: .semibold))
+        } icon: {
+            Image(systemName: "hand.tap")
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .card()
     }
 
@@ -175,6 +219,35 @@ struct RemoteView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .card()
+    }
+}
+
+private struct DeviceRow: View {
+    let device: TVDevice
+    let current: Bool
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "tv").frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(device.name).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    Text(device.kind == .samsung ? "Samsung Tizen · \(device.host)" : "Android TV · \(device.host)")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                if current { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.primary.opacity(hover ? 0.08 : 0)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
     }
 }
 

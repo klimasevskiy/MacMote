@@ -154,6 +154,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Головний екран", action: #selector(home), keyEquivalent: "").target = self
         menu.addItem(.separator())
+        let tvMenu = NSMenu()
+        for d in tv.devices {
+            let item = tvMenu.addItem(withTitle: d.name, action: #selector(pickTV(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = d
+            item.state = d.id == tv.device?.id ? .on : .off
+        }
+        if !tv.devices.isEmpty { tvMenu.addItem(.separator()) }
+        tvMenu.addItem(withTitle: "Шукати телевізори…", action: #selector(searchTVs), keyEquivalent: "").target = self
+        let tvItem = menu.addItem(withTitle: "Телевізор", action: nil, keyEquivalent: "")
+        tvItem.submenu = tvMenu
         let login = menu.addItem(withTitle: "Запускати при вході", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -167,6 +178,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func home() { tv.connect(); tv.send(.home) }
+    @objc private func pickTV(_ item: NSMenuItem) { if let d = item.representedObject as? TVDevice { tv.select(d) } }
+
+    @objc private func searchTVs() {
+        if panel == nil { open() }
+        tv.scan(choose: true)
+    }
     @objc private func forget() { tv.forget() }
 
     @objc private func about() {

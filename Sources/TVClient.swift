@@ -1,373 +1,260 @@
 import Foundation
-import Network
-import Security
-import CryptoKit
 
-/// Android KeyEvent codes.
-enum Key: Int {
-    case home = 3, back = 4, up = 19, down = 20, left = 21, right = 22, center = 23
-    case volumeUp = 24, volumeDown = 25, power = 26, enter = 66, del = 67
-    case playPause = 85, next = 87, mute = 164
-}
+enum Key {
+    case home, back, up, down, left, right, center
+    case volumeUp, volumeDown, power, enter, del, playPause, mute
 
-/// TLS connection carrying varint-framed protobuf messages.
-final class Link {
-    private let conn: NWConnection
-    private var framer = Framer()
-    private(set) var serverCert: SecCertificate?
-    var onMessage: (PBMsg) -> Void = { _ in }
-    var onReady: () -> Void = {}
-    var onFail: (Error?) -> Void = { _ in }
-
-    init(host: String, port: UInt16, identity: SecIdentity) {
-        let tls = NWProtocolTLS.Options()
-        let sec = tls.securityProtocolOptions
-        sec_protocol_options_set_local_identity(sec, sec_identity_create(identity)!)
-        let box = CertBox()
-        sec_protocol_options_set_verify_block(sec, { _, trust, done in
-            let t = sec_trust_copy_ref(trust).takeRetainedValue()
-            box.cert = (SecTrustCopyCertificateChain(t) as? [SecCertificate])?.first
-            done(true) // TV uses a self-signed cert
-        }, .main)
-        let tcp = NWProtocolTCP.Options()
-        tcp.connectionTimeout = 5
-        tcp.enableKeepalive = true
-        conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!,
-                            using: NWParameters(tls: tls, tcp: tcp))
-        conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
-            switch state {
-            case .ready:
-                self.serverCert = box.cert
-                self.onReady()
-                self.receive()
-            case .failed(let e): self.finish(e)
-            case .waiting(let e): self.finish(e)
-            default: break
-            }
+    /// Android KeyEvent code.
+    var androidCode: Int {
+        switch self {
+        case .home: 3
+        case .back: 4
+        case .up: 19
+        case .down: 20
+        case .left: 21
+        case .right: 22
+        case .center: 23
+        case .volumeUp: 24
+        case .volumeDown: 25
+        case .power: 26
+        case .enter: 66
+        case .del: 67
+        case .playPause: 85
+        case .mute: 164
         }
     }
 
-    private final class CertBox { var cert: SecCertificate? }
-
-    func start() { conn.start(queue: .main) }
-
-    func send(_ body: Data) {
-        conn.send(content: PB.varint(body.count) + body, completion: .contentProcessed { _ in })
-    }
-
-    func cancel() {
-        onFail = { _ in }
-        conn.cancel()
-    }
-
-    private func finish(_ e: Error?) {
-        let cb = onFail
-        cancel()
-        cb(e)
-    }
-
-    private func receive() {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, done, err in
-            guard let self else { return }
-            if let data {
-                for m in self.framer.push(data) { if let msg = PBMsg(m) { self.onMessage(msg) } }
-            }
-            if done || err != nil { self.finish(err) } else { self.receive() }
+    /// Samsung SmartView key name.
+    var samsungCode: String {
+        switch self {
+        case .home: "KEY_HOME"
+        case .back: "KEY_RETURN"
+        case .up: "KEY_UP"
+        case .down: "KEY_DOWN"
+        case .left: "KEY_LEFT"
+        case .right: "KEY_RIGHT"
+        case .center, .enter: "KEY_ENTER"
+        case .volumeUp: "KEY_VOLUP"
+        case .volumeDown: "KEY_VOLDOWN"
+        case .power: "KEY_POWER"
+        case .del: "KEY_BACKSPACE"
+        case .playPause: "KEY_PLAY_BACK"
+        case .mute: "KEY_MUTE"
         }
     }
 }
 
-final class TVClient: ObservableObject {
-    enum State: Equatable {
-        case idle, searching, connecting, pairing, enterCode, connected
-        case offline(String)
-    }
+struct TVDevice: Codable, Hashable {
+    enum Kind: String, Codable { case android, samsung }
+    var kind: Kind
+    var name: String
+    var host: String
+    /// Stable across IP changes; keys pairing data.
+    var id: String { "\(kind.rawValue):\(name)" }
+}
+
+enum TVState: Equatable {
+    case idle, searching, choosing, connecting, pairing, enterCode, confirmOnTV, connected
+    case offline(String)
+}
+
+protocol BackendDelegate: AnyObject {
+    func backend(state: TVState)
+    func backend(text: String)
+    func backend(pairingError: String?)
+    func backend(mac: String)
+    /// The TV could not be reached at its saved address.
+    func backendUnreachable(_ message: String)
+}
+
+protocol TVBackend: AnyObject {
+    var delegate: BackendDelegate? { get set }
+    func connect()
+    func disconnect()
+    func resetPairing()
+    func send(_ key: Key)
+    func editText(from old: String, to new: String)
+    func submitText()
+    func submitCode(_ code: String)
+}
+
+/// Front for whichever TV is selected: discovery, selection, reconnects, Wake-on-LAN.
+final class TVClient: ObservableObject, BackendDelegate {
+    typealias State = TVState
 
     @Published private(set) var state: State = .idle
-    @Published private(set) var tvName: String = UserDefaults.standard.string(forKey: "tvName") ?? "TV"
+    @Published private(set) var device: TVDevice?
+    @Published private(set) var devices: [TVDevice] = []
     @Published var pairingError: String?
     /// Current contents of the focused text field on the TV.
     @Published private(set) var tvText = ""
 
-    private var host: String? {
-        get { UserDefaults.standard.string(forKey: "tvHost") }
-        set { UserDefaults.standard.set(newValue, forKey: "tvHost") }
+    var tvName: String { device?.name ?? "TV" }
+
+    private var backend: TVBackend?
+    private var discovery: Discovery?
+    private var rediscovered = false
+    private var idleTimer: Timer?
+
+    init() {
+        Self.migrate()
+        if let data = UserDefaults.standard.data(forKey: "device") {
+            device = try? JSONDecoder().decode(TVDevice.self, from: data)
+        }
+        if let device { devices = [device] }
     }
-    private var paired: Bool {
-        get { UserDefaults.standard.bool(forKey: "paired") }
-        set { UserDefaults.standard.set(newValue, forKey: "paired") }
+
+    private func save() {
+        UserDefaults.standard.set(device.flatMap { try? JSONEncoder().encode($0) }, forKey: "device")
     }
 
     private var mac: String? {
-        get { UserDefaults.standard.string(forKey: "tvMAC") }
-        set { UserDefaults.standard.set(newValue, forKey: "tvMAC") }
+        get { device.flatMap { UserDefaults.standard.string(forKey: "mac.\($0.id)") } }
+        set { if let device { UserDefaults.standard.set(newValue, forKey: "mac.\(device.id)") } }
     }
 
-    private var identity: SecIdentity?
-    private var remote: Link?
-    private var pairing: Link?
-    private var browser: NWBrowser?
-    private var resolver: NWConnection?
-    private var imeCounter = 0, fieldCounter = 0
-    private var rediscovered = false
-    private var idleTimer: Timer?
+    /// v1.0 stored a single Android TV under flat keys.
+    private static func migrate() {
+        let d = UserDefaults.standard
+        guard d.data(forKey: "device") == nil, let host = d.string(forKey: "tvHost") else { return }
+        let dev = TVDevice(kind: .android, name: d.string(forKey: "tvName") ?? "TV", host: host)
+        d.set(try? JSONEncoder().encode(dev), forKey: "device")
+        d.set(d.bool(forKey: "paired"), forKey: "paired.\(dev.id)")
+        d.set(d.string(forKey: "tvMAC"), forKey: "mac.\(dev.id)")
+        for k in ["tvHost", "tvName", "paired", "tvMAC"] { d.removeObject(forKey: k) }
+    }
 
     // MARK: lifecycle
 
     func connect() {
         idleTimer?.invalidate()
         switch state {
-        case .connected, .connecting, .searching, .pairing, .enterCode: return
-        default: break
+        case .idle, .offline: break
+        default: return
         }
-        do { identity = try identity ?? ClientIdentity.load() } catch {
-            state = .offline(error.localizedDescription); return
-        }
-        if let host { paired ? openRemote(host) : startPairing(host) } else { discover() }
+        guard let device else { scan(choose: false); return }
+        if backend == nil { backend = makeBackend(device) }
+        backend?.connect()
     }
 
-    /// Drop the connection a while after the popover closes to keep the app fully idle.
+    private func makeBackend(_ d: TVDevice) -> TVBackend {
+        let b: TVBackend = d.kind == .samsung ? SamsungTV(device: d) : AndroidTV(device: d)
+        b.delegate = self
+        return b
+    }
+
+    /// Drop the connection a while after the remote closes to keep the app fully idle.
     func scheduleIdleDisconnect() {
         idleTimer?.invalidate()
-        guard state != .enterCode && state != .pairing else { return }
+        // Keep waiting while the user is pairing or picking a TV.
+        guard ![.searching, .choosing, .pairing, .enterCode, .confirmOnTV].contains(state) else { return }
         idleTimer = Timer.scheduledTimer(withTimeInterval: 90, repeats: false) { [weak self] _ in
             self?.disconnect()
         }
     }
 
     func disconnect() {
-        remote?.cancel(); remote = nil
-        pairing?.cancel(); pairing = nil
-        browser?.cancel(); browser = nil
-        resolver?.cancel(); resolver = nil
+        backend?.disconnect()
+        discovery?.cancel(); discovery = nil
         state = .idle
     }
 
+    /// Pair with the current TV again.
     func forget() {
-        disconnect()
-        host = nil
+        backend?.resetPairing()
+        backend = nil
         mac = nil
-        paired = false
-        ClientIdentity.reset()
-        identity = nil
+        state = .idle
+        connect()
+    }
+
+    func select(_ d: TVDevice) {
+        backend?.disconnect()
+        backend = nil
+        device = d
+        save()
+        tvText = ""
+        pairingError = nil
+        state = .idle
         connect()
     }
 
     // MARK: discovery
 
-    private func discover() {
+    /// Searches the network. With `choose`, always ends in the TV picker.
+    func scan(choose: Bool) {
+        idleTimer?.invalidate()
+        backend?.disconnect()
+        discovery?.cancel()
         state = .searching
-        let b = NWBrowser(for: .bonjour(type: "_androidtvremote2._tcp", domain: nil), using: .tcp)
-        b.browseResultsChangedHandler = { [weak self] results, _ in
-            guard let self, let r = results.first, self.resolver == nil else { return }
-            if case .service(let name, _, _, _) = r.endpoint { self.tvName = name }
-            UserDefaults.standard.set(self.tvName, forKey: "tvName")
-            self.resolve(r.endpoint)
-        }
-        b.stateUpdateHandler = { [weak self] s in
-            if case .failed(let e) = s { self?.state = .offline("Пошук: \(e.localizedDescription)") }
-        }
-        browser = b
-        b.start(queue: .main)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
-            guard let self, self.state == .searching, self.resolver == nil else { return }
-            self.browser?.cancel(); self.browser = nil
-            self.state = .offline("Телевізор не знайдено в мережі")
-        }
-    }
-
-    private func resolve(_ endpoint: NWEndpoint) {
-        let tcp = NWProtocolTCP.Options()
-        tcp.connectionTimeout = 5
-        let params = NWParameters(tls: nil, tcp: tcp)
-        (params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options)?.version = .v4
-        let c = NWConnection(to: endpoint, using: params)
-        resolver = c
-        c.stateUpdateHandler = { [weak self] s in
-            guard let self else { return }
-            switch s {
-            case .ready:
-                if case .hostPort(let h, _)? = c.currentPath?.remoteEndpoint {
-                    var str = "\(h)"
-                    if let pct = str.firstIndex(of: "%") { str = String(str[..<pct]) }
-                    self.host = str
+        let disc = Discovery()
+        discovery = disc
+        disc.run { [weak self] found in
+            guard let self, self.discovery === disc else { return }
+            self.discovery = nil
+            self.devices = found
+            if choose && !found.isEmpty { self.state = .choosing; return }
+            if let want = self.device {
+                if let match = found.first(where: { $0.id == want.id }) {
+                    if match.host != want.host { self.device = match; self.save(); self.backend = nil }
+                    self.state = .idle
+                    self.connect()
+                } else if found.isEmpty {
+                    self.state = .offline("Телевізор не знайдено в мережі")
+                } else {
+                    self.state = .choosing
                 }
-                c.cancel(); self.resolver = nil
-                self.browser?.cancel(); self.browser = nil
-                self.state = .idle
-                self.connect()
-            case .failed(let e), .waiting(let e):
-                c.cancel(); self.resolver = nil
-                self.state = .offline(e.localizedDescription)
-            default: break
-            }
-        }
-        c.start(queue: .main)
-    }
-
-    // MARK: pairing (port 6467)
-
-    private func pairMsg(_ build: (inout PB) -> Void) -> Data {
-        PB.build { p in p.int(1, 2); p.int(2, 200); build(&p) }
-    }
-
-    private func startPairing(_ host: String) {
-        guard let identity else { return }
-        state = .pairing
-        pairingError = nil
-        let l = Link(host: host, port: 6467, identity: identity)
-        pairing = l
-        l.onReady = { [weak l, weak self] in
-            guard let self else { return }
-            l?.send(self.pairMsg { $0.msg(10) { $0.string(1, "atvremote"); $0.string(2, "MacMote") } })
-        }
-        l.onMessage = { [weak self, weak l] m in
-            guard let self, let l else { return }
-            guard m.int(2) == 200 else {
-                self.pairingError = "Телевізор відхилив сполучення (\(m.int(2) ?? 0))"
-                if self.state != .enterCode { self.pairing?.cancel(); self.pairing = nil; self.state = .offline(self.pairingError!) }
-                return
-            }
-            let hexEncoding: (inout PB) -> Void = { $0.int(1, 3); $0.int(2, 6) }
-            if m.has(11) {
-                l.send(self.pairMsg { $0.msg(20) { $0.msg(1, hexEncoding); $0.int(3, 1) } })
-            } else if m.has(20) {
-                l.send(self.pairMsg { $0.msg(30) { $0.msg(1, hexEncoding); $0.int(2, 1) } })
-            } else if m.has(31) {
-                self.state = .enterCode
-            } else if m.has(41) {
-                self.paired = true
-                l.cancel(); self.pairing = nil
-                self.state = .idle
-                self.connect()
-            }
-        }
-        l.onFail = { [weak self] e in
-            guard let self else { return }
-            self.pairing = nil
-            self.state = .offline(e.map { "Сполучення: \($0.localizedDescription)" } ?? "Телевізор розірвав з'єднання")
-            self.retryDiscoveryIfNeeded()
-        }
-        l.start()
-    }
-
-    func submitCode(_ raw: String) {
-        let code = raw.trimmingCharacters(in: .whitespaces).uppercased()
-        guard code.count == 6, let first = UInt8(code.prefix(2), radix: 16),
-              let tail = Data(hex: String(code.dropFirst(2))) else {
-            pairingError = "Код має містити 6 символів (0-9, A-F)"; return
-        }
-        guard let l = pairing, let identity, let serverCert = l.serverCert else { return }
-        var cert: SecCertificate?
-        SecIdentityCopyCertificate(identity, &cert)
-        guard let cert, let c = ClientIdentity.rsaComponents(of: cert),
-              let s = ClientIdentity.rsaComponents(of: serverCert) else {
-            pairingError = "Не вдалося прочитати ключі"; return
-        }
-        var h = SHA256()
-        h.update(data: c.n); h.update(data: c.e)
-        h.update(data: s.n); h.update(data: s.e)
-        h.update(data: tail)
-        let digest = Data(h.finalize())
-        guard digest[0] == first else { pairingError = "Невірний код"; return }
-        pairingError = nil
-        l.send(pairMsg { $0.msg(40) { $0.bytes(1, digest) } })
-    }
-
-    // MARK: remote (port 6466)
-
-    private func openRemote(_ host: String) {
-        guard let identity else { return }
-        state = .connecting
-        let l = Link(host: host, port: 6466, identity: identity)
-        remote = l
-        var gotMessage = false
-        l.onMessage = { [weak self, weak l] m in
-            guard let self, let l else { return }
-            gotMessage = true
-            if m.has(1) {
-                l.send(PB.build { $0.msg(1) { p in
-                    p.int(1, 615)
-                    p.msg(2) { d in
-                        d.string(1, "MacBook"); d.string(2, "Apple"); d.int(3, 1)
-                        d.string(4, "1"); d.string(5, "atvremote"); d.string(6, "1.0.0")
-                    }
-                } })
-            } else if m.has(2) {
-                l.send(PB.build { $0.msg(2) { $0.int(1, 615) } })
-                self.state = .connected
-                self.rediscovered = false
-                if self.mac == nil { self.mac = WakeOnLAN.mac(for: host) }
-            } else if let ping = m.sub(8) {
-                l.send(PB.build { $0.msg(9) { $0.int(1, ping.int(1) ?? 0) } })
-            } else if let field = m.sub(20)?.sub(2) ?? m.sub(22)?.sub(2) {
-                // Text field focused/updated on the TV
-                self.fieldCounter = field.int(1) ?? self.fieldCounter
-                self.tvText = field.string(2) ?? ""
-            } else if let edit = m.sub(21) {
-                self.imeCounter = edit.int(1) ?? 0
-                if let f = edit.int(2), f != 0 { self.fieldCounter = f }
-            } else if m.has(3) {
-                self.state = .offline("Помилка від телевізора")
-            }
-        }
-        l.onFail = { [weak self] e in
-            guard let self else { return }
-            self.remote = nil
-            if !gotMessage, case .tls? = e as? NWError {
-                // TV no longer trusts our certificate — pair again.
-                self.paired = false
-                self.state = .idle
-                self.connect()
-            } else if gotMessage {
-                self.state = .idle // dropped; reconnect on next action
+            } else if found.count == 1 {
+                self.select(found[0])
             } else {
-                self.state = .offline(e?.localizedDescription ?? "Немає з'єднання")
-                self.retryDiscoveryIfNeeded()
+                self.state = found.isEmpty ? .offline("Телевізор не знайдено в мережі") : .choosing
             }
         }
-        l.start()
     }
 
-    /// The TV's IP may have changed — rediscover once.
-    private func retryDiscoveryIfNeeded() {
-        guard !rediscovered else { return }
-        rediscovered = true
-        host = nil
-        state = .idle
-        connect()
+    // MARK: BackendDelegate
+
+    func backend(state: State) {
+        self.state = state
+        if state == .connected { rediscovered = false }
     }
+
+    func backend(text: String) { tvText = text }
+    func backend(pairingError: String?) { self.pairingError = pairingError }
+    func backend(mac: String) { if self.mac == nil { self.mac = mac } }
+
+    func backendUnreachable(_ message: String) {
+        // The TV's IP may have changed — rediscover once.
+        if !rediscovered {
+            rediscovered = true
+            scan(choose: false)
+        } else {
+            state = .offline(message)
+        }
+    }
+
+    // MARK: commands
 
     func send(_ key: Key) {
-        guard state == .connected, let remote else {
+        guard state == .connected, let backend else {
             if key == .power, let mac { WakeOnLAN.wake(mac) } // TV asleep: try to wake it
             connect(); return
         }
-        remote.send(PB.build { $0.msg(10) { $0.int(1, key.rawValue); $0.int(2, 3) } })
+        backend.send(key)
     }
 
-    /// Brings the TV text field from `old` to `new`. The TV inserts text at its cursor,
-    /// so only the difference is sent: Delete presses for removed characters, then the new tail.
+    /// Brings the TV's focused text field from `old` to `new`.
     func editText(from old: String, to new: String) {
         guard state == .connected else { return }
-        let prefix = old.commonPrefix(with: new)
-        for _ in 0..<(old.count - prefix.count) { send(.del) }
-        let tail = String(new.dropFirst(prefix.count))
-        if !tail.isEmpty { insertText(tail, cursor: max(new.utf16.count - 1, 0)) }
+        backend?.editText(from: old, to: new)
     }
 
-    private func insertText(_ text: String, cursor: Int) {
-        guard let remote else { return }
-        remote.send(PB.build { $0.msg(21) { p in
-            p.int(1, imeCounter)
-            p.int(2, fieldCounter)
-            p.msg(3) { e in
-                e.int(1, 1)
-                e.msg(2) { o in o.int(1, cursor); o.int(2, cursor); o.string(3, text) }
-            }
-        } })
+    func submitText() {
+        guard state == .connected else { connect(); return }
+        backend?.submitText()
     }
+
+    func submitCode(_ code: String) { backend?.submitCode(code) }
 }
 
 extension Data {
