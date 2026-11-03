@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/icon.png" width="128" alt="MacMote icon"></p>
+<p align="center"><img src="docs/banner-en.png" alt="MacMote — your TV remote, right in the menu bar"></p>
 
 <h1 align="center">MacMote</h1>
 
@@ -66,7 +66,7 @@ You only need the Xcode Command Line Tools (`xcode-select --install`).
 ./build.sh zip    # + build/MacMote.zip for a release
 ```
 
-To regenerate the icon, run `swift scripts/make-icon.swift`.
+To regenerate the icon, run `swift scripts/make-icon.swift`. The promo banners in `docs/` come from `scripts/make-banner.swift` (the build command is at the top of the file).
 
 ## How it works
 

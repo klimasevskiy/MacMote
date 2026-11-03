@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/icon.png" width="128" alt="MacMote icon"></p>
+<p align="center"><img src="docs/banner-uk.png" alt="MacMote — пульт від телевізора прямо в рядку меню"></p>
 
 <h1 align="center">MacMote</h1>
 
@@ -66,7 +66,7 @@
 ./build.sh zip    # + build/MacMote.zip для релізу
 ```
 
-Іконку перегенерувати: `swift scripts/make-icon.swift`.
+Іконку перегенерувати: `swift scripts/make-icon.swift`. Рекламні банери в `docs/` генерує `scripts/make-banner.swift` (команда збірки — на початку файлу).
 
 ## Як це працює
 
